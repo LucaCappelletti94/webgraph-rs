@@ -6,6 +6,9 @@ set -e
 GRAPH="$1" # the graph basename is the first argument
 WEBGRAPH="cargo run --release --"
 
+# Step 0: Set the Rust flags so to ensure the best performance
+export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto $RUSTFLAGS"
+
 # Step 1: Create the Elias Fano
 $WEBGRAPH build ef $GRAPH
 # Step2: Run a BFS traversal to get the initial permutation
