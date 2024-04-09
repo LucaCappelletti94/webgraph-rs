@@ -6,12 +6,15 @@
  * SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
  */
 
+use self::llp::preds::MinAvgImprov;
+
 use super::utils::*;
 use crate::prelude::*;
 use anyhow::{bail, Context, Result};
 use clap::{ArgMatches, Args, Command, FromArgMatches};
 use dsi_bitstream::prelude::*;
 use epserde::prelude::*;
+use llp::invert_permutation;
 use llp::preds::{MaxUpdates, MinGain, MinModified, PercModified};
 
 use predicates::prelude::*;
@@ -52,8 +55,13 @@ struct CliArgs {
     perc_modified: Option<f64>,
 
     #[arg(short = 't', long, default_value_t = MinGain::DEFAULT_THRESHOLD)]
-    /// The gain threshold used to stop the computation (1 to disable).
+    /// The gain threshold used to stop the computation (0 to disable).
     gain_threshold: f64,
+
+    #[arg(short = 'i', long, default_value_t = MinAvgImprov::DEFAULT_THRESHOLD)]
+    /// The threshold on the average (over the last ten updates) gain
+    /// improvement used to stop the computation (-Inf to disable).
+    improv_threshold: f64,
 
     #[clap(flatten)]
     num_cpus: NumCpusArg,
@@ -106,6 +114,10 @@ where
     let start = std::time::Instant::now();
 
     // Load the graph in THP memory
+    log::info!(
+        "Loading graph {} in THP memory...",
+        args.basename.to_string_lossy()
+    );
     let graph = BVGraph::with_basename(&args.basename)
         .mode::<LoadMmap>()
         .flags(MemoryFlags::TRANSPARENT_HUGE_PAGES | MemoryFlags::RANDOM_ACCESS)
@@ -113,6 +125,7 @@ where
         .load()?;
 
     // Load degree cumulative function in THP memory
+    log::info!("Loading DCF in THP memory...");
     let deg_cumul = DCF::load_mmap(
         args.basename.with_extension(DEG_CUMUL_EXTENSION),
         Flags::TRANSPARENT_HUGE_PAGES | Flags::RANDOM_ACCESS,
@@ -143,7 +156,9 @@ where
     gammas.sort_by(|a, b| a.total_cmp(b));
 
     let mut predicate = MinGain::try_from(args.gain_threshold)?.boxed();
-
+    predicate = predicate
+        .or(MinAvgImprov::try_from(args.improv_threshold)?)
+        .boxed();
     predicate = predicate.or(MaxUpdates::from(args.max_updates)).boxed();
 
     if args.modified {
@@ -169,7 +184,9 @@ where
 
     let mut llp_perm = (0..graph.num_nodes()).collect::<Vec<_>>();
     llp_perm.par_sort_by(|&a, &b| labels[a].cmp(&labels[b]));
-    crate::algo::llp::invert_in_place(llp_perm.as_mut_slice());
+
+    let mut llp_inv_perm = vec![0; llp_perm.len()];
+    invert_permutation(llp_perm.as_ref(), llp_inv_perm.as_mut());
 
     log::info!("Elapsed: {}", start.elapsed().as_secs_f64());
     log::info!("Saving permutation...");
@@ -177,14 +194,14 @@ where
     let perm = args.perm;
 
     if args.epserde {
-        llp_perm
+        llp_inv_perm
             .store(&perm)
             .with_context(|| format!("Could not write permutation to {}", perm.display()))?;
     } else {
         let mut file = std::fs::File::create(&perm)
             .with_context(|| format!("Could not create permutation at {}", perm.display()))?;
         let mut buf = BufWriter::new(&mut file);
-        for word in llp_perm.into_iter() {
+        for word in llp_inv_perm.into_iter() {
             buf.write_all(&word.to_be_bytes())
                 .with_context(|| format!("Could not write permutation to {}", perm.display()))?;
         }

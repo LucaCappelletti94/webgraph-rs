@@ -19,6 +19,7 @@ use lender::*;
 /// A sequential BVGraph that can be read from a `codes_reader_builder`.
 /// The builder is needed because we should be able to create multiple iterators
 /// and this allows us to have a single place where to store the mmaped file.
+#[derive(Debug, Clone)]
 pub struct BVGraphSeq<F> {
     factory: F,
     number_of_nodes: usize,
@@ -143,7 +144,7 @@ where
     for<'a> F::Decoder<'a>: Decode,
 {
     #[inline(always)]
-    /// Create an iterator specialized in the degrees of the nodes.
+    /// Creates an iterator specialized in the degrees of the nodes.
     /// This is slightly faster because it can avoid decoding some of the nodes
     /// and completely skip the merging step.
     pub fn offset_deg_iter(&self) -> OffsetDegIter<F::Decoder<'_>> {
@@ -158,7 +159,7 @@ where
 
 /// A fast sequential iterator over the nodes of the graph and their successors.
 /// This iterator does not require to know the offsets of each node in the graph.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Iter<D: Decode> {
     pub(crate) number_of_nodes: usize,
     pub(crate) compression_window: usize,

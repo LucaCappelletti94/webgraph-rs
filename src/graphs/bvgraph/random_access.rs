@@ -15,6 +15,7 @@ use self::sequential::Iter;
 
 /// BVGraph is an highly compressed graph format that can be traversed
 /// sequentially or randomly without having to decode the whole graph.
+#[derive(Debug, Clone)]
 pub struct BVGraph<F> {
     factory: F,
     number_of_nodes: usize,
@@ -264,10 +265,28 @@ where
     }
 }
 
+impl<F: RandomAccessDecoderFactory> BVGraph<F>
+where
+    for<'a> F::Decoder<'a>: Decode,
+{
+    #[inline(always)]
+    /// Creates an iterator specialized in the degrees of the nodes.
+    /// This is slightly faster because it can avoid decoding some of the nodes
+    /// and completely skip the merging step.
+    pub fn offset_deg_iter(&self) -> OffsetDegIter<F::Decoder<'_>> {
+        OffsetDegIter::new(
+            self.factory.new_decoder(0).unwrap(),
+            self.number_of_nodes,
+            self.compression_window,
+            self.min_interval_length,
+        )
+    }
+}
 impl<F> RandomAccessGraph for BVGraph<F> where F: RandomAccessDecoderFactory {}
 
 /// The iterator returend from [`BVGraph`] that returns the successors of a
 /// node in sorted order.
+#[derive(Debug, Clone)]
 pub struct Succ<D: Decode> {
     reader: D,
     /// The number of values left

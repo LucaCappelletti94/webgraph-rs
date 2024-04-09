@@ -42,6 +42,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env::temp_dir;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -94,6 +95,7 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
     seed: u64,
     predicate: impl Predicate<preds::PredParams>,
 ) -> Result<Box<[usize]>> {
+    const IMPROV_WINDOW: usize = 10;
     let num_nodes = sym_graph.num_nodes();
     let chunk_size = chunk_size.unwrap_or(1_000_000);
     let granularity = granularity.unwrap_or(((sym_graph.num_arcs() >> 9) as usize).max(1024));
@@ -125,6 +127,8 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
     // init the iteration progress logger
     let mut iter_pl = progress_logger!(item_name = "update");
 
+    let hash_map_init = (sym_graph.num_arcs() / sym_graph.num_nodes() as u64).max(16) as usize;
+
     // init the update progress logger
     let mut update_pl = progress_logger!(item_name = "node", local_speed = true);
 
@@ -142,11 +146,15 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
             gamma_index + 1,
             gammas.len(),
         ));
-        let mut obj_func = 0.0;
         label_store.init();
         can_change
-            .iter()
-            .for_each(|x| x.store(true, Ordering::Relaxed));
+            .par_iter()
+            .with_min_len(1024)
+            .for_each(|c| c.store(true, Ordering::Relaxed));
+
+        let mut obj_func = 0.0;
+        let mut prev_gain = f64::MAX;
+        let mut improv_window: VecDeque<_> = vec![1.0; IMPROV_WINDOW].into();
 
         for update in 0.. {
             update_pl.expected_updates(Some(num_nodes));
@@ -167,11 +175,14 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
 
             let delta_obj_func = sym_graph.par_apply(
                 |range| {
-                    let mut map = HashMap::with_capacity_and_hasher(1024, mix64::Mix64Builder);
                     let mut rand = SmallRng::seed_from_u64(range.start as u64);
                     let mut local_obj_func = 0.0;
                     for &node in &update_perm[range] {
-                        // if the node can't change we can skip it
+                        // Note that here we are using a heuristic optimization:
+                        // if no neighbor has changed, the label of a node
+                        // cannot change. If gamma != 0, this is not necessarily
+                        // true, as a node might need to change its value just
+                        // because of a change of volume of the adjacent labels.
                         if !can_change[node].load(Ordering::Relaxed) {
                             continue;
                         }
@@ -179,19 +190,16 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
                         can_change[node].store(false, Ordering::Relaxed);
 
                         let successors = sym_graph.successors(node);
-                        // TODO
-                        /*if successors.len() == 0 {
-                            continue;
-                        }*/
                         if sym_graph.outdegree(node) == 0 {
                             continue;
                         }
 
                         // get the label of this node
                         let curr_label = label_store.label(node);
-                        // get the count of how many times a
-                        // label appears in the successors
-                        map.clear();
+
+                        // compute the frequency of successor labels
+                        let mut map =
+                            HashMap::with_capacity_and_hasher(hash_map_init, mix64::Mix64Builder);
                         for succ in successors {
                             map.entry(label_store.label(succ))
                                 .and_modify(|counter| *counter += 1)
@@ -205,20 +213,17 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
                         let mut majorities = vec![];
                         // compute the most entropic label
                         for (&label, &count) in map.iter() {
-                            // The compensation for the current label is
-                            // necessary as we do not decrement its volume, as
-                            // the Java version does.
+                            // For replication of the results of the Java
+                            // version, one needs to decrement the volume of
+                            // the current value the Java version does
+                            // (see the commented code below).
                             //
                             // Note that this is not exactly equivalent to the
                             // behavior of the Java version, as during the
                             // execution of this loop if another thread reads
                             // the volume of the current label it will get a
-                            // value larger by one WRT the Java version. This
-                            // difference does not seem to effect the outcome,
-                            // whereas this compensation has a major effect, in
-                            // particular in the initial phases, when the volume
-                            // is one.
-                            let volume = label_store.volume_fetch_sub(label); // - (label == curr_label) as usize;
+                            // value larger by one WRT the Java version.
+                            let volume = label_store.volume(label); // - (label == curr_label) as usize;
                             let val = (1.0 + gamma) * count as f64 - gamma * (volume + 1) as f64;
 
                             if max == val {
@@ -244,7 +249,7 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
                             for succ in sym_graph.successors(node) {
                                 can_change[succ].store(true, Ordering::Relaxed);
                             }
-                            label_store.volume_set(node, next_label);
+                            label_store.update(node, next_label);
                         }
                         local_obj_func += max - old;
                     }
@@ -262,14 +267,22 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
 
             obj_func += delta_obj_func;
             let gain = delta_obj_func / obj_func;
+            let gain_impr = (prev_gain - gain) / prev_gain;
+            prev_gain = gain;
+            improv_window.pop_front();
+            improv_window.push_back(gain_impr);
+            let avg_gain_impr = improv_window.iter().sum::<f64>() / IMPROV_WINDOW as f64;
 
-            info!("Gain: {}", gain);
+            info!("Gain: {gain}");
+            info!("Gain improvement: {gain_impr}");
+            info!("Average gain improvement: {avg_gain_impr}");
             info!("Modified: {}", modified.load(Ordering::Relaxed),);
 
             if predicate.eval(&PredParams {
                 num_nodes: sym_graph.num_nodes(),
                 num_arcs: sym_graph.num_arcs(),
                 gain,
+                avg_gain_impr,
                 modified: modified.load(Ordering::Relaxed),
                 update,
             }) || modified.load(Ordering::Relaxed) == 0
@@ -280,12 +293,29 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
 
         iter_pl.done();
 
-        update_perm.iter_mut().enumerate().for_each(|(i, x)| *x = i);
-        // create sorted clusters by contiguous labels
-        update_perm.par_sort_by(|&a, &b| label_store.label(a as _).cmp(&label_store.label(b as _)));
-        invert_in_place(&mut update_perm);
+        // We temporarily use the update permutation to compute the sorting
+        // permutation of the labels.
+        let perm = &mut update_perm;
+        perm.par_iter_mut()
+            .enumerate()
+            .with_min_len(1024)
+            .for_each(|(i, x)| *x = i);
+        // Sort by label
+        perm.par_sort_by(|&a, &b| label_store.label(a as _).cmp(&label_store.label(b as _)));
 
+        // Save labels
         let labels = label_store.labels();
+        let mut file =
+            std::fs::File::create(labels_path(gamma_index)).context("Could not write labels")?;
+        labels
+            .serialize(&mut file)
+            .context("Could not serialize labels")?;
+
+        // We temporarily use the label array from the label store to compute
+        // the inverse permutation. It will be reinitialized at the next
+        // iteration anyway.
+        let inv_perm = labels;
+        invert_permutation(perm, inv_perm);
 
         update_pl.expected_updates(Some(num_nodes));
         update_pl.start("Computing log-gap cost...");
@@ -293,7 +323,7 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
         let cost = gap_cost::compute_log_gap_cost(
             &PermutedGraph {
                 graph: sym_graph,
-                perm: &update_perm,
+                perm: &inv_perm,
             },
             granularity,
             deg_cumul,
@@ -305,13 +335,6 @@ pub fn layered_label_propagation<R: RandomAccessGraph + Sync>(
 
         info!("Log-gap cost: {}", cost);
         costs.push(cost);
-
-        // storing the perms
-        let mut file =
-            std::fs::File::create(labels_path(gamma_index)).context("Could not write labels")?;
-        labels
-            .serialize(&mut file)
-            .context("Could not serialize labels")?;
 
         gamma_pl.update_and_display();
     }
@@ -388,38 +411,39 @@ fn combine(result: &mut [usize], labels: &[usize], temp_perm: &mut [usize]) -> R
     Ok(curr_label + 1)
 }
 
-/// Invert the given permutation in place.
-#[doc(hidden)]
-pub fn invert_in_place(perm: &mut [usize]) {
-    for n in 0..perm.len() {
-        let mut i = perm[n];
-        if (i as isize) < 0 {
-            perm[n] = !i;
-        } else if i != n {
-            let mut k = n;
-            loop {
-                let j = perm[i];
-                perm[i] = !k;
-                if j == n {
-                    perm[n] = i;
-                    break;
-                }
-                k = i;
-                i = j;
-            }
-        }
+use std::cell::UnsafeCell;
+
+#[derive(Copy, Clone)]
+struct UnsafeSlice<'a, T>(&'a [UnsafeCell<T>]);
+unsafe impl<'a, T: Send + Sync> Send for UnsafeSlice<'a, T> {}
+unsafe impl<'a, T: Send + Sync> Sync for UnsafeSlice<'a, T> {}
+
+impl<'a, T> UnsafeSlice<'a, T> {
+    fn new(slice: &'a mut [T]) -> Self {
+        #![allow(trivial_casts)]
+        Self(unsafe { &*(slice as *mut [T] as *const [UnsafeCell<T>]) })
+    }
+
+    /// Writes a value to the slice at the given index.
+    ///
+    /// This method makes it possible to write in the slice
+    /// without borrowing the slice mutably.
+    ///
+    /// # Safety
+    ///
+    /// It is UB if two threads write to the same index without
+    /// synchronization.
+    unsafe fn write(&self, i: usize, value: T) {
+        let ptr = self.0[i].get();
+        *ptr = value;
     }
 }
-
-#[cfg(test)]
-#[test]
-fn test_invert_in_place() {
-    use rand::prelude::SliceRandom;
-    let mut v = (0..1000).collect::<Vec<_>>();
-    v.shuffle(&mut rand::thread_rng());
-    let mut w = v.clone();
-    invert_in_place(&mut w);
-    for i in 0..v.len() {
-        assert_eq!(w[v[i]], i);
-    }
+pub fn invert_permutation(perm: &[usize], inv_perm: &mut [usize]) {
+    let unsafe_slice = UnsafeSlice::new(inv_perm);
+    perm.par_iter()
+        .enumerate()
+        .with_min_len(1024)
+        .for_each(|(i, &x)| unsafe {
+            unsafe_slice.write(x, i);
+        });
 }
